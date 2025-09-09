@@ -1,0 +1,316 @@
+name: ci
+
+on:
+  push:
+    paths:
+      - 'terraform/**'
+      - 'policy/**'
+      - 'sonar-project.properties'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'terraform/**'
+      - 'policy/**'
+      - 'sonar-project.properties'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write   # für SARIF Upload
+  actions: read
+  pull-requests: read
+
+jobs:
+  plan-and-scan:
+    runs-on: ubuntu-latest
+    env:
+      TF_PLUGIN_CACHE_DIR: ${{ runner.temp }}/tofu_plugin_cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # gut für Vergleiche/Blame
+
+      # --- Cache: OpenTofu Provider-Plugins ---
+      - name: Cache Tofu plugin cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tofu-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            tofu-plugins-${{ runner.os }}-
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Tools (jq, Checkov, Conftest)
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y jq >/dev/null
+          python3 -m pip install --user pipx || true
+          python3 -m pipx ensurepath || true
+          ~/.local/bin/pipx install checkov || true
+          ~/.local/bin/pipx install conftest || true
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      # ---------- TFLint ----------
+      - name: TFLint (Terraform lint)
+        working-directory: terraform
+        run: |
+          set -Eeuo pipefail
+          tflint --init
+          # SARIF + Plain Text; nicht failen lassen (wir gaten später)
+          tflint -f sarif > ../tflint.sarif || true
+          tflint -f default || true
+
+      # ---------- CHECKOV ----------
+      - name: IaC Scan (Terraform+K8s) → JSON + SARIF (Checkov)
+        run: |
+          set -Eeuo pipefail
+          checkov -d terraform --framework terraform,kubernetes --soft-fail -o json  > checkov.json
+          checkov -d terraform --framework terraform,kubernetes --soft-fail -o sarif > checkov.sarif
+
+      - name: Checkov summary (Top 3 → Job Summary)
+        run: |
+          set -Eeuo pipefail
+          echo "##  Checkov – Zusammenfassung" >> $GITHUB_STEP_SUMMARY
+          jq -s '
+            def sevnum(s):
+              (s|ascii_upcase) as $s
+              | if   $s=="CRITICAL" then 0
+                elif $s=="HIGH"     then 1
+                elif $s=="MEDIUM"   then 2
+                elif $s=="LOW"      then 3
+                else 4 end;
+            def norm(f):
+              { sev: (f.severity // "UNKNOWN")|ascii_upcase,
+                id:  (f.check_id // "CHECK"),
+                title: (f.check_name // "Finding"),
+                resource: (f.resource // f.resource_address // "n/a"),
+                file: (f.file_path // "n/a"),
+                line: ( (f.file_line_range // [])[0] // null ),
+                score: ( if (f.severity|ascii_upcase)=="CRITICAL" then 100
+                         elif (f.severity|ascii_upcase)=="HIGH"   then 80
+                         elif (f.severity|ascii_upcase)=="MEDIUM" then 50
+                         elif (f.severity|ascii_upcase)=="LOW"    then 20
+                         else 0 end )};
+            (.[0].results.failed_checks // []) as $fc
+            | ($fc | map(norm(.))) as $N
+            | {
+                counts: ( reduce $N[] as $x ({}; .[$x.sev] = ( (.[$x.sev] // 0) + 1 ) ) ),
+                top3:   ( $N | sort_by( sevnum(.sev), -(.score), .id ) | .[0:3] )
+              }
+          ' checkov.json > checkov-summary.json || echo '{}' > checkov-summary.json
+
+          jq -r '
+            (.counts // {}) as $c
+            | "### Befunde nach Schweregrad\n\n| Severity | Count |\n|---|---:|\n"
+              + (["CRITICAL","HIGH","MEDIUM","LOW","UNKNOWN"]
+                 | map("| " + . + " | " + (( $c[.] // 0 )|tostring) + " |")
+                 | join("\n"))
+              + "\n\n### Top 3 Findings\n"
+          ' checkov-summary.json >> $GITHUB_STEP_SUMMARY
+
+          jq -r '
+            ( .top3 // [] ) as $t
+            | if ($t|length)==0
+              then "_Keine Findings._"
+              else ($t
+                | to_entries
+                | map("* **[" + ((.key+1)|tostring) + "] " + .value.title + "** – " + .value.sev
+                      + " – " + .value.resource + " (" + .value.file
+                      + (if .value.line then ":" + (.value.line|tostring) else "" end) + ")")
+                | join("\n"))
+              end
+          ' checkov-summary.json >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Checkov/TFLint SARIF to GitHub Code Scanning
+        if: ${{ always() }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+
+      - name: Upload TFLint SARIF to GitHub Code Scanning
+        if: ${{ always() }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tflint.sarif
+
+      - name: Upload static scan artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-scans
+          path: |
+            checkov.json
+            checkov-summary.json
+            checkov.sarif
+            tflint.sarif
+
+      - name: Fail on HIGH/CRITICAL (Checkov)
+        run: |
+          set -Eeuo pipefail
+          jq -e '
+            (.results.failed_checks // [])
+            | map((.severity // "UNKNOWN") | ascii_upcase)
+            | any(. == "CRITICAL" or . == "HIGH")
+          ' checkov.json \
+            && { echo "Checkov found HIGH/CRITICAL issues"; exit 1; } \
+            || echo "No HIGH/CRITICAL in Checkov scan"
+
+      # ---------- TOFU PLAN ----------
+      - name: Tofu plan -> JSON
+        working-directory: terraform
+        env:
+          TF_PLUGIN_CACHE_DIR: ${{ env.TF_PLUGIN_CACHE_DIR }}
+        run: |
+          set -Eeuo pipefail
+          tofu fmt -check -recursive
+          tofu init -input=false -upgrade
+          tofu validate -no-color
+          tofu plan -out=tfplan -var-file=envs/local.tfvars -input=false
+          tofu show -json tfplan > ../plan.json
+
+      # ---------- WIZ (optional) ----------
+      - name: Install Wiz CLI (Linux amd64)
+        if: ${{ secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL -o wizcli https://downloads.wiz.io/wizcli/latest/wizcli-linux-amd64
+          chmod +x wizcli
+          ./wizcli --version
+
+      - name: Wiz CLI Auth
+        if: ${{ secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        env:
+          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+        run: ./wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+
+      - name: Wiz IaC scan (terraform dir)
+        if: ${{ secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        run: ./wizcli iac scan --path ./terraform -o wiz-iac.json,json
+
+      - name: Wiz IaC scan (plan.json)
+        if: ${{ secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        run: ./wizcli iac scan --path ./plan.json -o wiz-plan.json,json
+
+      - name: Wiz summary (Top 3 → Job Summary)
+        if: ${{ always() && secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        run: |
+          set -Eeuo pipefail
+          echo "##  Wiz IaC – Zusammenfassung" >> $GITHUB_STEP_SUMMARY
+          jq -s '
+            def rank(s): {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}[s] // 9;
+            def norm:
+              (..|objects|select(has("severity")))
+              | {sev:(.severity|tostring|ascii_upcase),
+                 title:(.title // .ruleName // .id // .rule // "Finding"),
+                 resource:(.resource // .resourceName // .filePath // .file // .path // "n/a"),
+                 file:(.filePath // .file // "n/a"),
+                 line:(.line // .startLine // .start_line // null),
+                 score:(.riskScore // .score // 0)};
+            [inputs | norm] as $all
+            | $all as $a
+            | {counts:
+                 (reduce $a[] as $f ({}; .[$f.sev] = ( (.[$f.sev] // 0) + 1 ))),
+               top3:
+                 ($a | sort_by( rank(.sev), -(.score) ) | .[0:3])}
+          ' wiz-iac.json wiz-plan.json > wiz-summary.json || echo "{}" > wiz-summary.json
+
+          jq -r '
+            (.counts // {}) as $c
+            | "### Befunde nach Schweregrad\n\n| Severity | Count |\n|---|---:|\n"
+              + (["CRITICAL","HIGH","MEDIUM","LOW","INFO"]
+                 | map("| " + . + " | " + (( $c[.] // 0 )|tostring) + " |") | join("\n"))
+              + "\n\n### Top 3 Findings\n"
+          ' wiz-summary.json >> $GITHUB_STEP_SUMMARY
+
+          jq -r '
+            ( .top3 // [] ) as $t
+            | if ($t|length)==0
+              then "_Keine Findings._"
+              else ($t
+                | to_entries
+                | map("* **[" + ((.key+1)|tostring) + "] " + .value.title + "** – " + .value.sev
+                      + " – " + .value.resource + " (" + .value.file
+                      + (if .value.line then ":" + (.value.line|tostring) else "" end) + ")")
+                | join("\n"))
+              end
+          ' wiz-summary.json >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Wiz reports
+        if: ${{ always() && secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: wiz-reports
+          path: |
+            wiz-iac.json
+            wiz-plan.json
+            wiz-summary.json
+
+      - name: Fail on HIGH/CRITICAL (Wiz)
+        if: ${{ secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        run: |
+          set -Eeuo pipefail
+          cat wiz-iac.json wiz-plan.json | grep -E '"severity":"(HIGH|CRITICAL)"' \
+            && { echo "Wiz found HIGH/CRITICAL issues"; exit 1; } \
+            || echo "No HIGH/CRITICAL in Wiz scans"
+
+      # ---------- OPA / Conftest ----------
+      - name: OPA/Conftest Policies
+        run: |
+          set -Eeuo pipefail
+          conftest test plan.json -p policy
+
+      - name: Upload plan.json
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tofu-plan
+          path: plan.json
+
+  sonar:
+    needs: plan-and-scan
+    if: ${{ vars.SONAR_HOST_URL != '' && secrets.SONAR_TOKEN != '' }}
+    runs-on: self-hosted    # <— damit dein lokales Sonar erreichbar ist
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # wichtig für „New Code“
+
+      - name: Sanity check Sonar connectivity
+        env:
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        run: |
+          set -Eeuo pipefail
+          echo "→ SONAR_HOST_URL: $SONAR_HOST_URL"
+          curl -sf "$SONAR_HOST_URL/api/system/status" || { echo "Sonar nicht erreichbar"; exit 1; }
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        # args sind optional, wenn 'sonar-project.properties' im Repo-Root liegt
+        with:
+          args: >
+            -Dsonar.projectKey=poc-observability-security
+            -Dsonar.sources=.
+
+      - name: SonarQube Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        timeout-minutes: 15
