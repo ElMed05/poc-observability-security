@@ -21,24 +21,24 @@ concurrency:
 
 permissions:
   contents: read
-  security-events: write   # für SARIF Upload
+  security-events: write
   actions: read
   pull-requests: read
 
 jobs:
   plan-and-scan:
     runs-on: ubuntu-latest
+    env:
+      TF_PLUGIN_CACHE_DIR: .tfcache
+      # Secrets/Vars für if:-Checks als ENV bereitstellen
+      WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+      WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
 
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # gut für Vergleiche/Blame
+          fetch-depth: 0
 
-      # --- Definiere lokalen Plugin-Cache-Pfad (ohne runner.temp) ---
-      - name: Define TF plugin cache dir
-        run: echo "TF_PLUGIN_CACHE_DIR=.tfcache" >> "$GITHUB_ENV"
-
-      # --- Cache: OpenTofu Provider-Plugins ---
       - name: Cache Tofu plugin cache
         uses: actions/cache@v4
         with:
@@ -72,7 +72,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           tflint --init
-          # SARIF + Plain Text; nicht failen lassen (wir gaten später)
           tflint -f sarif > ../tflint.sarif || true
           tflint -f default || true
 
@@ -186,7 +185,7 @@ jobs:
 
       # ---------- WIZ (optional) ----------
       - name: Install Wiz CLI (Linux amd64)
-        if: ${{ secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
+        if: ${{ env.WIZ_CLIENT_ID != '' && env.WIZ_CLIENT_SECRET != '' }}
         run: |
           set -Eeuo pipefail
           curl -fsSL -o wizcli https://downloads.wiz.io/wizcli/latest/wizcli-linux-amd64
@@ -194,22 +193,22 @@ jobs:
           ./wizcli --version
 
       - name: Wiz CLI Auth
-        if: ${{ secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
+        if: ${{ env.WIZ_CLIENT_ID != '' && env.WIZ_CLIENT_SECRET != '' }}
         env:
-          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
-          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+          WIZ_CLIENT_ID: ${{ env.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ env.WIZ_CLIENT_SECRET }}
         run: ./wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
 
       - name: Wiz IaC scan (terraform dir)
-        if: ${{ secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
+        if: ${{ env.WIZ_CLIENT_ID != '' && env.WIZ_CLIENT_SECRET != '' }}
         run: ./wizcli iac scan --path ./terraform -o wiz-iac.json,json
 
       - name: Wiz IaC scan (plan.json)
-        if: ${{ secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
+        if: ${{ env.WIZ_CLIENT_ID != '' && env.WIZ_CLIENT_SECRET != '' }}
         run: ./wizcli iac scan --path ./plan.json -o wiz-plan.json,json
 
       - name: Wiz summary (Top 3 → Job Summary)
-        if: ${{ always() && secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
+        if: ${{ always() && env.WIZ_CLIENT_ID != '' && env.WIZ_CLIENT_SECRET != '' }}
         run: |
           set -Eeuo pipefail
           echo "##  Wiz IaC – Zusammenfassung" >> $GITHUB_STEP_SUMMARY
@@ -240,7 +239,7 @@ jobs:
           ' wiz-summary.json >> $GITHUB_STEP_SUMMARY
 
       - name: Upload Wiz reports
-        if: ${{ always() && secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
+        if: ${{ always() && env.WIZ_CLIENT_ID != '' && env.WIZ_CLIENT_SECRET != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: wiz-reports
@@ -250,7 +249,7 @@ jobs:
             wiz-summary.json
 
       - name: Fail on HIGH/CRITICAL (Wiz)
-        if: ${{ secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
+        if: ${{ env.WIZ_CLIENT_ID != '' && env.WIZ_CLIENT_SECRET != '' }}
         run: |
           set -Eeuo pipefail
           cat wiz-iac.json wiz-plan.json | grep -E '"severity":"(HIGH|CRITICAL)"' \
@@ -272,16 +271,18 @@ jobs:
 
   sonar:
     needs: plan-and-scan
-    if: ${{ vars.SONAR_HOST_URL != '' && secrets.SONAR_TOKEN != '' }}
-    runs-on: self-hosted    # lokaler Runner, weil Sonar auf Minikube
+    runs-on: self-hosted
+    env:
+      SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    if: ${{ env.SONAR_HOST_URL != '' && env.SONAR_TOKEN != '' }}
+
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # wichtig für „New Code“
+          fetch-depth: 0
 
       - name: Sanity check Sonar connectivity
-        env:
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         run: |
           set -Eeuo pipefail
           echo "→ SONAR_HOST_URL: $SONAR_HOST_URL"
@@ -290,8 +291,8 @@ jobs:
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@v2
         env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
         with:
           args: >
             -Dsonar.projectKey=poc-observability-security
@@ -300,6 +301,6 @@ jobs:
       - name: SonarQube Quality Gate
         uses: SonarSource/sonarqube-quality-gate-action@v1
         env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
         timeout-minutes: 15
