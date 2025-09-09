@@ -28,18 +28,21 @@ permissions:
 jobs:
   plan-and-scan:
     runs-on: ubuntu-latest
-    env:
-      TF_PLUGIN_CACHE_DIR: ${{ runner.temp }}/tofu_plugin_cache
+
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # gut für Vergleiche/Blame
 
+      # --- Definiere lokalen Plugin-Cache-Pfad (ohne runner.temp) ---
+      - name: Define TF plugin cache dir
+        run: echo "TF_PLUGIN_CACHE_DIR=.tfcache" >> "$GITHUB_ENV"
+
       # --- Cache: OpenTofu Provider-Plugins ---
       - name: Cache Tofu plugin cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          path: ./.tfcache
           key: tofu-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
           restore-keys: |
             tofu-plugins-${{ runner.os }}-
@@ -134,7 +137,7 @@ jobs:
               end
           ' checkov-summary.json >> $GITHUB_STEP_SUMMARY
 
-      - name: Upload Checkov/TFLint SARIF to GitHub Code Scanning
+      - name: Upload Checkov SARIF to GitHub Code Scanning
         if: ${{ always() }}
         uses: github/codeql-action/upload-sarif@v3
         with:
@@ -172,7 +175,7 @@ jobs:
       - name: Tofu plan -> JSON
         working-directory: terraform
         env:
-          TF_PLUGIN_CACHE_DIR: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          TF_PLUGIN_CACHE_DIR: .tfcache
         run: |
           set -Eeuo pipefail
           tofu fmt -check -recursive
@@ -183,7 +186,7 @@ jobs:
 
       # ---------- WIZ (optional) ----------
       - name: Install Wiz CLI (Linux amd64)
-        if: ${{ secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        if: ${{ secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
         run: |
           set -Eeuo pipefail
           curl -fsSL -o wizcli https://downloads.wiz.io/wizcli/latest/wizcli-linux-amd64
@@ -191,22 +194,22 @@ jobs:
           ./wizcli --version
 
       - name: Wiz CLI Auth
-        if: ${{ secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        if: ${{ secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: ./wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
 
       - name: Wiz IaC scan (terraform dir)
-        if: ${{ secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        if: ${{ secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
         run: ./wizcli iac scan --path ./terraform -o wiz-iac.json,json
 
       - name: Wiz IaC scan (plan.json)
-        if: ${{ secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        if: ${{ secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
         run: ./wizcli iac scan --path ./plan.json -o wiz-plan.json,json
 
       - name: Wiz summary (Top 3 → Job Summary)
-        if: ${{ always() && secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        if: ${{ always() && secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
         run: |
           set -Eeuo pipefail
           echo "##  Wiz IaC – Zusammenfassung" >> $GITHUB_STEP_SUMMARY
@@ -236,21 +239,8 @@ jobs:
               + "\n\n### Top 3 Findings\n"
           ' wiz-summary.json >> $GITHUB_STEP_SUMMARY
 
-          jq -r '
-            ( .top3 // [] ) as $t
-            | if ($t|length)==0
-              then "_Keine Findings._"
-              else ($t
-                | to_entries
-                | map("* **[" + ((.key+1)|tostring) + "] " + .value.title + "** – " + .value.sev
-                      + " – " + .value.resource + " (" + .value.file
-                      + (if .value.line then ":" + (.value.line|tostring) else "" end) + ")")
-                | join("\n"))
-              end
-          ' wiz-summary.json >> $GITHUB_STEP_SUMMARY
-
       - name: Upload Wiz reports
-        if: ${{ always() && secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        if: ${{ always() && secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
         uses: actions/upload-artifact@v4
         with:
           name: wiz-reports
@@ -260,7 +250,7 @@ jobs:
             wiz-summary.json
 
       - name: Fail on HIGH/CRITICAL (Wiz)
-        if: ${{ secrets.WIZ_CLIENT_ID != '' && secrets.WIZ_CLIENT_SECRET != '' }}
+        if: ${{ secrets.WIZ_CLIENT_ID != null && secrets.WIZ_CLIENT_SECRET != null }}
         run: |
           set -Eeuo pipefail
           cat wiz-iac.json wiz-plan.json | grep -E '"severity":"(HIGH|CRITICAL)"' \
@@ -283,7 +273,7 @@ jobs:
   sonar:
     needs: plan-and-scan
     if: ${{ vars.SONAR_HOST_URL != '' && secrets.SONAR_TOKEN != '' }}
-    runs-on: self-hosted    # <— damit dein lokales Sonar erreichbar ist
+    runs-on: self-hosted    # lokaler Runner, weil Sonar auf Minikube
     steps:
       - uses: actions/checkout@v4
         with:
@@ -302,7 +292,6 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
-        # args sind optional, wenn 'sonar-project.properties' im Repo-Root liegt
         with:
           args: >
             -Dsonar.projectKey=poc-observability-security
