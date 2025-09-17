@@ -58,11 +58,20 @@ jobs:
           set -Eeuo pipefail
           sudo apt-get update -y >/dev/null
           sudo apt-get install -y jq >/dev/null
-          python3 -m pip install --user pipx || true
-          python3 -m pipx ensurepath || true
-          ~/.local/bin/pipx install checkov || true
-          ~/.local/bin/pipx install conftest || true
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+          # --- Checkov (Python) ---
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --user checkov
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          ~/.local/bin/checkov --version
+
+          # --- Conftest (Go-Binary) ---
+          CONFTEST_VERSION="0.55.0"
+          curl -fsSL -o conftest.tar.gz "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+          tar -xzf conftest.tar.gz
+          sudo mv conftest /usr/local/bin/conftest
+          conftest --version
+
 
       # ---------- TFLint ----------
       - name: TFLint (Terraform lint)
